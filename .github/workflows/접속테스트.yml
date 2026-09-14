@@ -1,0 +1,177 @@
+name: 시세 사이트 접속 테스트
+
+# 버튼으로 직접 돌릴 때만 실행된다 (자동 실행 없음)
+on:
+  workflow_dispatch:
+
+jobs:
+  connectivity:
+    name: 접속 확인
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 구구스·엘러브·와이즈럭스 접속 확인
+        shell: bash
+        run: |
+          cat > 접속테스트.py <<'PYEND'
+          # -*- coding: utf-8 -*-
+          """시세 수집 대상 3개 사이트가 이 컴퓨터(또는 이 서버)에서 열리는지 확인한다.
+
+          맥에서 한 번, GitHub Actions 에서 한 번 돌려 결과를 비교하는 것이 목적이다.
+          HTTP 200 만으로는 부족하다 — 차단 페이지도 200 으로 오기 때문에,
+          실제 수집 코드가 찾는 내용이 응답 안에 있는지까지 확인한다.
+          """
+          import json, re, sys, time, gzip, socket, urllib.request, urllib.error, urllib.parse
+
+          UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+          TIMEOUT = 30
+          결과 = []
+
+
+          def 표시(s, n):
+              """한글은 폭 2칸으로 세어 표를 맞춘다."""
+              w = sum(2 if ord(c) > 0x2E80 else 1 for c in s)
+              return s + " " * max(0, n - w)
+
+
+          def 요청(url, data=None, headers=None, label=""):
+              hdrs = {"User-Agent": UA, "Accept-Encoding": "gzip"}
+              if headers:
+                  hdrs.update(headers)
+              parts = urllib.parse.urlsplit(url)        # 상품 URL 에 한글이 섞여 있다
+              url = urllib.parse.urlunsplit((parts.scheme, parts.netloc,
+                                             urllib.parse.quote(parts.path),
+                                             parts.query, parts.fragment))
+              req = urllib.request.Request(url, data=data, headers=hdrs,
+                                           method="POST" if data else "GET")
+              t0 = time.time()
+              with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                  raw = r.read()
+                  if r.headers.get("Content-Encoding") == "gzip":
+                      raw = gzip.decompress(raw)
+                  return r.status, raw, time.time() - t0
+
+
+          def 검사(이름, fn):
+              print(f"\n── {이름} ──", flush=True)
+              t0 = time.time()
+              try:
+                  메모 = fn()
+                  걸린 = time.time() - t0
+                  print(f"   ✅ 통과  ({걸린:.1f}초)  {메모}", flush=True)
+                  결과.append((이름, True, f"{걸린:.1f}초", 메모))
+              except Exception as e:
+                  걸린 = time.time() - t0
+                  사유 = f"{type(e).__name__}: {e}"[:160]
+                  print(f"   ❌ 실패  ({걸린:.1f}초)  {사유}", flush=True)
+                  결과.append((이름, False, f"{걸린:.1f}초", 사유))
+
+
+          # ── 구구스 ─────────────────────────────────────────────
+          def 구구스():
+              """실제 수집과 같은 POST 를 던지고, 상품 배열이 오는지 본다."""
+              body = json.dumps({
+                  "brandList": [61],            # 에르메스
+                  "downDate": "ALL",
+                  "sortOrder": "highPrice",
+                  "perPage": 5, "page": 1,
+              }).encode()
+              st, raw, _ = 요청("https://gugus.co.kr/goodsList/selectListGoodsBase",
+                                data=body,
+                                headers={"Content-Type": "application/json",
+                                         "Referer": "https://gugus.co.kr/"})
+              txt = raw.decode("utf-8", "replace")
+              m = re.search(r"var products\s*=\s*(\[.*?\]);", txt, re.S)
+              if not m:
+                  raise RuntimeError(f"상품 배열 없음 (status={st}, {len(raw)}바이트) — 차단 페이지일 수 있음")
+              items = json.loads(m.group(1))
+              if not items:
+                  raise RuntimeError("상품 배열이 비어 있음")
+              global 구구스_상품번호
+              구구스_상품번호 = items[0].get("gdsNo")
+              return f"{len(items)}건 파싱, 첫 상품 {구구스_상품번호}"
+
+
+          def 구구스_상세():
+              g = globals().get("구구스_상품번호")
+              if not g:
+                  raise RuntimeError("목록 수집이 먼저 실패해 건너뜀")
+              st, raw, _ = 요청(f"https://gugus.co.kr/goods/viewGoods?goodsNo={g}",
+                                headers={"Referer": "https://gugus.co.kr/"})
+              txt = raw.decode("utf-8", "replace")
+              if "goodsNo" not in txt and "상품" not in txt:
+                  raise RuntimeError(f"상세 페이지 내용 이상 (status={st}, {len(raw)}바이트)")
+              return f"{len(raw):,}바이트 수신"
+
+
+          # ── 엘러브 / 와이즈럭스 ────────────────────────────────
+          def 사이트맵(호스트, 이름):
+              st, raw, _ = 요청(f"{호스트}/sitemap.xml")
+              txt = raw.decode("utf-8", "replace")
+              locs = re.findall(r"<loc>([^<]+)</loc>", txt)
+              if not locs:
+                  raise RuntimeError(f"<loc> 없음 (status={st}, {len(raw)}바이트) — 차단 페이지일 수 있음")
+              상품 = [l for l in locs if re.search(r"/product/[^/]+/\d+/?$", l)]
+              자식 = 0
+              if not 상품:                               # 색인형 사이트맵 — 자식을 따라 들어간다
+                  for 자 in locs[:3]:
+                      _, raw2, _ = 요청(자)
+                      if 자.endswith(".gz"):
+                          raw2 = gzip.decompress(raw2)
+                      자식 += 1
+                      상품 += [l for l in re.findall(r"<loc>([^<]+)</loc>",
+                                                    raw2.decode("utf-8", "replace"))
+                               if re.search(r"/product/[^/]+/\d+/?$", l)]
+                      if 상품:
+                          break
+              if not 상품:
+                  raise RuntimeError(f"상품 URL 을 못 찾음 (loc {len(locs)}개, 자식 {자식}개 확인)")
+              globals()[f"{이름}_첫상품"] = 상품[0]
+              꼬리 = f", 자식 사이트맵 {자식}개 경유" if 자식 else ""
+              return f"상품 {len(상품)}개{꼬리}"
+
+
+          def 상세(이름):
+              u = globals().get(f"{이름}_첫상품")
+              if not u:
+                  raise RuntimeError("사이트맵에서 상품 URL 을 못 얻어 건너뜀 (색인형 사이트맵일 수 있음)")
+              st, raw, _ = 요청(u)
+              if len(raw) < 2000:
+                  raise RuntimeError(f"응답이 너무 작음 (status={st}, {len(raw)}바이트)")
+              return f"{len(raw):,}바이트 수신"
+
+
+          print("=" * 62)
+          print(" 시세 수집 대상 사이트 접속 테스트")
+          print("=" * 62)
+          try:
+              ip = urllib.request.urlopen("https://api.ipify.org", timeout=10).read().decode()
+              print(f" 나가는 IP : {ip}")
+          except Exception:
+              print(" 나가는 IP : 확인 실패")
+          print(f" 호스트     : {socket.gethostname()}")
+          print(f" 시각       : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+          검사("구구스 목록 API", 구구스)
+          검사("구구스 상품 상세", 구구스_상세)
+          검사("엘러브 사이트맵", lambda: 사이트맵("https://eluv.co.kr", "엘러브"))
+          검사("엘러브 상품 상세", lambda: 상세("엘러브"))
+          검사("와이즈럭스 사이트맵", lambda: 사이트맵("https://wiselux.co.kr", "와이즈럭스"))
+          검사("와이즈럭스 상품 상세", lambda: 상세("와이즈럭스"))
+
+          print("\n" + "=" * 62)
+          print(" 결과 요약")
+          print("=" * 62)
+          for 이름, ok, 초, 메모 in 결과:
+              print(f" {표시(이름, 22)} {'✅ 통과' if ok else '❌ 실패'}  {표시(초, 8)} {메모[:60]}")
+
+          실패 = [r for r in 결과 if not r[1]]
+          print("=" * 62)
+          if 실패:
+              print(f" ⚠️  {len(실패)}개 실패 — 이 환경에서는 수집이 안 됩니다.")
+              sys.exit(1)
+          print(" 🎉 전부 통과 — 이 환경에서 수집 가능합니다.")
+
+          PYEND
+          python3 접속테스트.py
