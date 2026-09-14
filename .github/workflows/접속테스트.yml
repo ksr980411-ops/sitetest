@@ -5,7 +5,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  테스트:
+  connectivity:
+    name: 접속 확인
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
